@@ -1,0 +1,126 @@
+name: Subtree Enforcement
+
+on:
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  enforce-subtree-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine base commit
+        run: |
+          BASE=$(git merge-base origin/master HEAD)
+          echo "BASE=$BASE" >> $GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # Detect changes
+      # ------------------------------------------------------------
+      - name: Detect subtree changes
+        run: |
+          git diff --name-only $BASE HEAD | grep '^services/laravel/' > /tmp/subtree_changes || true
+          git diff --name-only $BASE HEAD | grep -v '^services/laravel/' > /tmp/non_subtree_changes || true
+
+      # ------------------------------------------------------------
+      # Detecting Manual Subtree Edits
+      # ------------------------------------------------------------
+      # This step ensures that all changes to services/laravel/ are made
+      # using git subtree commands, not manual file edits.
+      #
+      # How it works:
+      # 1. Check if any files in services/laravel/ were modified
+      # 2. Search for commits containing git-subtree metadata
+      # 3. If subtree files changed but no git-subtree commits found → manual edit detected
+      #
+      # Git subtree commands (pull/push) automatically add special metadata
+      # to commit messages in this format:
+      #   "git-subtree-dir: services/laravel"
+      #   "git-subtree-split: <commit-hash>"
+      #
+      # Manual edits (e.g., editing files directly) do NOT have this metadata,
+      # so we can detect them by checking for its absence.
+      #
+      # Example of a valid git subtree commit message:
+      #   "Merge commit 'abc123' as 'services/laravel'"
+      #   "git-subtree-dir: services/laravel"
+      #   "git-subtree-mainline: xyz789"
+      #   "git-subtree-split: def456"
+      #
+      - name: Block manual subtree edits
+        run: |
+          # Check if any subtree files were modified in this PR
+          # -s flag checks if file exists and has size > 0
+          if [ -s /tmp/subtree_changes ]; then
+            # Search for commits between BASE and HEAD that contain
+            # the git-subtree metadata for services/laravel
+            # --grep searches commit messages for the pattern
+            SUBTREE_COMMITS=$(git log $BASE..HEAD --grep='git-subtree-dir: services/laravel')
+            
+            # If SUBTREE_COMMITS is empty (-z checks for zero length),
+            # it means subtree files were changed but no git-subtree
+            # commits were found → manual edits detected!
+            if [ -z "$SUBTREE_COMMITS" ]; then
+              echo "❌ Manual edits detected in services/laravel"
+              echo "Subtree changes must be done using git subtree pull/push"
+              echo ""
+              echo "To fix this:"
+              echo "1. Revert your manual changes"
+              echo "2. Use 'git subtree pull' to update from template"
+              echo "3. Or make changes in the template repository first"
+              exit 1
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # Blocking Mixed Commits
+      # ------------------------------------------------------------
+      - name: Block mixed subtree and app changes
+        run: |
+          if [ -s /tmp/subtree_changes ] && [ -s /tmp/non_subtree_changes ]; then
+            # Allow .template-version exception
+            NON_ALLOWED=$(grep -v 'services/laravel/.template-version' /tmp/non_subtree_changes || true)
+            if [ -n "$NON_ALLOWED" ]; then
+              echo "❌ Mixed commits detected"
+              echo "Subtree files and application files must not be modified together"
+              exit 1
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # Enforcing Subtree-Only Branches
+      # ------------------------------------------------------------
+      - name: Enforce subtree-only branches
+        run: |
+          if [ -s /tmp/subtree_changes ]; then
+            if [[ "$GITHUB_HEAD_REF" != subtree/*-sync ]]; then
+              echo "❌ Subtree changes must be made from a subtree/*-sync branch"
+              exit 1
+            fi
+
+            # Ensure only subtree + version file are touched
+            NON_ALLOWED=$(grep -vE '^services/laravel/|^services/laravel/.template-version$' /tmp/non_subtree_changes || true)
+            if [ -n "$NON_ALLOWED" ]; then
+              echo "❌ Subtree sync branches may only touch subtree files"
+              exit 1
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # Version File Validation
+      # ------------------------------------------------------------
+      - name: Validate template version file
+        run: |
+          if [ -s /tmp/subtree_changes ]; then
+            git diff $BASE HEAD -- services/laravel/.template-version >/dev/null
+            if [ $? -ne 0 ]; then
+              echo "❌ services/laravel/.template-version must be updated when subtree changes"
+              exit 1
+            fi
+          fi
